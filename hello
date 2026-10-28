@@ -1,0 +1,25 @@
+{
+  "name": "code-detector",
+  "displayName": "Code Detector",
+  "description": "一个简单的代码检测示例：扫描 console.log / debugger / TODO 等",
+  "version": "0.0.1",
+  "publisher": "your-name",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": ["Linters"],
+  "activationEvents": [
+    "onLanguage:javascript",
+    "onLanguage:typescript",
+    "onCommand:codeDetector.scanWorkspace"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "codeDetector.scanWorkspace",
+        "title": "Code Detector: 扫描所有已打开文件"
+      }
+    ]
+  }
+}
