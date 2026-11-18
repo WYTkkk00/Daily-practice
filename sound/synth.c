@@ -7,42 +7,166 @@
 #include <mmsystem.h>
 #include <stdio.h>
 #include <math.h>
+#include <conio.h>
 
 #define SAMPLE_RATE 44100
-#define BLOCK       1024          /* 每块帧数 */
-#define NBUFS       4             /* 缓冲块数 */
+#define BLOCK       1024
+#define NBUFS       4
 #define PI2         6.283185307179586
+#define NUM_KEYS    10
+#define MAX_VOICES  16
 
-static HWAVEOUT  g_wo = NULL;
-static short     g_buf[NBUFS][BLOCK * 2];   /* 立体声,每帧2个short */
-static WAVEHDR   g_hdr[NBUFS];
-static volatile int g_next = 0;             /* 下一块要填的索引 */
+/* ---------- 包络参数 (毫秒) ---------- */
+#define ATTACK_MS   10.0
+#define DECAY_MS    120.0
+#define RELEASE_MS  200.0
+#define SUSTAIN_LVL 0.55
+
+/* ---------- 波形 ---------- */
+#define WAVE_SINE   0
+#define WAVE_SQUARE 1
+static int g_wavetype = WAVE_SINE;
+
+static HWAVEOUT g_wo = NULL;
+static short    g_buf[NBUFS][BLOCK * 2];
+static WAVEHDR  g_hdr[NBUFS];
+static volatile int g_next = 0;
 static volatile int g_stop = 0;
 
-static double g_phase = 0.0;
-static double g_inc   = 0.0;
+/* ---------- 键盘映射 ---------- */
+static const int g_keycodes[NUM_KEYS] = {
+    'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', VK_OEM_1
+};
+static const int g_keymidi[NUM_KEYS] = {
+    60, 62, 64, 65, 67, 69, 71, 72, 74, 76
+};
+/* 记录每个琴键当前是否处于“按下->响”的状态 */
+static int g_keyheld[NUM_KEYS] = {0};
+
+/* ---------- 声部 ---------- */
+typedef struct {
+    int    active;
+    int    owner;       /* 属于哪个按键索引,-1 表示无 */
+    double phase;
+    double inc;
+    double env;
+    int    stage;
+    double t;
+    double vel;
+} Voice;
+
+static Voice g_voices[MAX_VOICES];
+
+static double note_freq(int midi)
+{
+    return 440.0 * pow(2.0, (midi - 69) / 12.0);
+}
+
+/* 找空闲声部并触发 */
+static int voice_alloc(int owner, int midi)
+{
+    int i;
+    for (i = 0; i < MAX_VOICES; i++) {
+        if (!g_voices[i].active) break;
+    }
+    if (i == MAX_VOICES) return -1;     /* 满了 */
+    {
+        Voice *v = &g_voices[i];
+        v->active = 1;
+        v->owner  = owner;
+        v->phase  = 0.0;
+        v->inc    = note_freq(midi) / SAMPLE_RATE;
+        v->env    = 0.0;
+        v->stage  = 0;
+        v->t      = 0.0;
+        v->vel    = 0.75;
+    }
+    return i;
+}
+
+/* 让属于某个按键的声部进入 release */
+static void voice_release_owner(int owner)
+{
+    int i;
+    for (i = 0; i < MAX_VOICES; i++) {
+        if (g_voices[i].active && g_voices[i].owner == owner &&
+            g_voices[i].stage < 3) {
+            g_voices[i].stage = 3;
+            g_voices[i].t = 0.0;
+        }
+    }
+}
+
+static double voice_tick(Voice *v)
+{
+    double s;
+    if (!v->active) return 0.0;
+
+    if (g_wavetype == WAVE_SINE)
+        s = sin(v->phase * PI2);
+    else
+        s = (v->phase < 0.5) ? 1.0 : -1.0;
+
+    v->t += 1.0 / SAMPLE_RATE;
+    switch (v->stage) {
+    case 0:
+        v->env = v->t / (ATTACK_MS / 1000.0);
+        if (v->env >= 1.0) { v->env = 1.0; v->stage = 1; v->t = 0.0; }
+        break;
+    case 1:
+    {
+        double k = v->t / (DECAY_MS / 1000.0);
+        if (k >= 1.0) { v->env = SUSTAIN_LVL; v->stage = 2; }
+        else v->env = 1.0 - (1.0 - SUSTAIN_LVL) * k;
+        break;
+    }
+    case 2:
+        v->env = SUSTAIN_LVL;
+        break;
+    case 3:
+    {
+        double k = v->t / (RELEASE_MS / 1000.0);
+        if (k >= 1.0) { v->active = 0; v->env = 0.0; }
+        else v->env = SUSTAIN_LVL * (1.0 - k);
+        break;
+    }
+    default:
+        v->env = 0.0;
+    }
+
+    v->phase += v->inc;
+    if (v->phase >= 1.0) v->phase -= 1.0;
+
+    return s * v->env * v->vel;
+}
 
 static void fill(int idx)
 {
     short *b = g_buf[idx];
-    int i;
+    int i, k;
     for (i = 0; i < BLOCK; i++) {
-        short v = (short)(sin(g_phase * PI2) * 12000.0);
-        b[i*2+0] = v;
-        b[i*2+1] = v;
-        g_phase += g_inc;
-        if (g_phase >= 1.0) g_phase -= 1.0;
+        double mix = 0.0;
+        for (k = 0; k < MAX_VOICES; k++)
+            mix += voice_tick(&g_voices[k]);
+
+        /* 软限幅:比直接截断更自然,和弦叠加时不刺耳 */
+        mix *= 0.25;
+        if (mix >  1.0) mix =  1.0;
+        if (mix < -1.0) mix = -1.0;
+
+        {
+            short v = (short)(mix * 16000.0);
+            b[i*2+0] = v;
+            b[i*2+1] = v;
+        }
     }
 }
 
-/* 系统回调:一块播完了,填下一块继续送 */
 static void CALLBACK wave_cb(HWAVEOUT hwo, UINT msg, DWORD_PTR inst,
                              DWORD_PTR p1, DWORD_PTR p2)
 {
     (void)hwo; (void)inst; (void)p1; (void)p2;
-    if (msg != WOM_DONE) return;
-    if (g_stop) return;
-
+    if (msg != WOM_DONE || g_stop) return;
     {
         int idx = g_next;
         g_next = (g_next + 1) % NBUFS;
@@ -51,11 +175,27 @@ static void CALLBACK wave_cb(HWAVEOUT hwo, UINT msg, DWORD_PTR inst,
     }
 }
 
+/* 扫描键盘,按状态触发/释放音符 */
+static void scan_keys(void)
+{
+    int i;
+    for (i = 0; i < NUM_KEYS; i++) {
+        int down = (GetAsyncKeyState(g_keycodes[i]) & 0x8000) != 0;
+        if (down && !g_keyheld[i]) {
+            g_keyheld[i] = 1;
+            voice_alloc(i, g_keymidi[i]);        /* 新按键 -> 触发新声部 */
+        } else if (!down && g_keyheld[i]) {
+            g_keyheld[i] = 0;
+            voice_release_owner(i);              /* 松键 -> 释放它自己的声部 */
+        }
+    }
+}
+
 int main(void)
 {
     WAVEFORMATEX wf;
     int i;
-    DWORD t0;
+    int last_wave_toggle = 0;
 
     ZeroMemory(&wf, sizeof(wf));
     wf.wFormatTag      = WAVE_FORMAT_PCM;
@@ -64,9 +204,6 @@ int main(void)
     wf.wBitsPerSample  = 16;
     wf.nBlockAlign     = wf.nChannels * wf.wBitsPerSample / 8;
     wf.nAvgBytesPerSec = wf.nSamplesPerSec * wf.nBlockAlign;
-    wf.cbSize          = 0;
-
-    g_inc = 440.0 / SAMPLE_RATE;
 
     if (waveOutOpen(&g_wo, WAVE_MAPPER, &wf,
                     (DWORD_PTR)wave_cb, 0, CALLBACK_FUNCTION) != MMSYSERR_NOERROR) {
@@ -74,7 +211,6 @@ int main(void)
         return 1;
     }
 
-    /* 先把所有块都填好并送入队列 */
     for (i = 0; i < NBUFS; i++) {
         ZeroMemory(&g_hdr[i], sizeof(WAVEHDR));
         g_hdr[i].lpData         = (LPSTR)g_buf[i];
@@ -84,17 +220,39 @@ int main(void)
         waveOutWrite(g_wo, &g_hdr[i], sizeof(WAVEHDR));
     }
 
-    printf("playing 440Hz for 10 seconds...\n");
+    printf("=== Mini Synth Sprint 2.1 和弦版 ===\n");
+    printf("hold: a s d f g h j k l ;   (C D E F G A B C D E)\n");
+    printf("try:  a+d+g  (C major chord) or a+d+f\n");
+    printf("w = waveform   q = quit\n");
     fflush(stdout);
 
-    /* 稳稳播 10 秒,期间什么都不做,让回调去喂数据 */
-    t0 = GetTickCount();
-    while (GetTickCount() - t0 < 10000) {
-        Sleep(50);
+    while (!g_stop) {
+        scan_keys();
+
+        /* 'w' 切换波形:用 GetAsyncKeyState 做边沿检测,避免重复触发 */
+        if (GetAsyncKeyState('W') & 0x8000) {
+            if (!last_wave_toggle) {
+                last_wave_toggle = 1;
+                g_wavetype = !g_wavetype;
+                printf("waveform: %s\n", g_wavetype == WAVE_SINE ? "sine" : "square");
+                fflush(stdout);
+            }
+        } else {
+            last_wave_toggle = 0;
+        }
+
+        if (GetAsyncKeyState('Q') & 0x8000) {
+            g_stop = 1;
+            break;
+        }
+
+        Sleep(5);
     }
 
-    printf("done.\n");
-    g_stop = 1;
+    printf("bye.\n");
+
+    /* 等尾音放完再收设备 */
+    Sleep(250);
     waveOutReset(g_wo);
     for (i = 0; i < NBUFS; i++)
         waveOutUnprepareHeader(g_wo, &g_hdr[i], sizeof(WAVEHDR));
