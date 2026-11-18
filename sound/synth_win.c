@@ -160,40 +160,87 @@ static void CALLBACK wave_cb(HWAVEOUT hwo, UINT msg, DWORD_PTR inst, DWORD_PTR p
 /* ---------------- UI 绘制 ---------------- */
 static void draw_wave(HWND hwnd)
 {
-    HDC hdc = GetDC(hwnd);
+    PAINTSTRUCT ps;
+    HDC hdc_win = BeginPaint(hwnd, &ps);   /* 用 BeginPaint,配合 WM_PAINT 更规范 */
+    HDC hdc;
+    HBITMAP bmp, oldbmp;
     RECT rc;
+    int i, mid, w;
     HBRUSH bg;
     HPEN pen, midpen;
-    int i, mid;
 
     GetClientRect(hwnd, &rc);
+    w = rc.right;
     mid = WAVE_H / 2;
+
+    /* ---------- 内存缓冲 ---------- */
+    hdc  = CreateCompatibleDC(hdc_win);
+    bmp  = CreateCompatibleBitmap(hdc_win, rc.right, rc.bottom);
+    oldbmp = (HBITMAP)SelectObject(hdc, bmp);
 
     /* 背景 */
     bg = CreateSolidBrush(RGB(16, 18, 24));
     FillRect(hdc, &rc, bg);
     DeleteObject(bg);
 
-    /* 波形 */
+    /* ---------- 波形 ---------- */
     pen = CreatePen(PS_SOLID, 2, RGB(80, 235, 160));
     SelectObject(hdc, pen);
 
-    {
-        int w = rc.right;
-        int step = RING_SIZE / w;    /* 每个像素取一个样本 */
-        if (step < 1) step = 1;
+        {
+        int i2;
+        int newest = (g_ring_w - 1 + RING_SIZE) % RING_SIZE;
+        int period = 0;          /* 估计的一个波长(采样数) */
+        int span;                /* 这一屏实际要显示的采样数 */
+        int start;
+
+        /* ---- 1. 估计波长: 往回找两个相邻上升过零点 ---- */
+        {
+            int p = newest;
+            int back, armed = 0, zc_count = 0;
+            int last_zc = -1, prev_zc = -1;
+            for (back = 0; back < 4000; back++) {
+                int cur = g_ring[p];
+                if (cur < -2000) armed = 1;
+                else if (armed && cur > 2000) {
+                    prev_zc = last_zc;
+                    last_zc = back;
+                    zc_count++;
+                    armed = 0;
+                    if (zc_count >= 2) break;   /* 找到两个就够了 */
+                }
+                p = (p - 1 + RING_SIZE) % RING_SIZE;
+            }
+            if (zc_count >= 2 && last_zc > prev_zc)
+                period = last_zc - prev_zc;     /* 一个周期多少采样 */
+        }
+
+        /* ---- 2. 由波长决定一屏显示多少采样 ---- */
+        if (period > 4) {
+            span = period * 3;                  /* 一屏显示约 3 个周期 */
+        } else {
+            span = w;                           /* 没测出周期(静音)就保持原样 */
+        }
+
+        /* 限制在合理范围内 */
+        if (span < 120)   span = 120;           /* 最少 120 个采样,避免高频时一屏太挤 */
+        if (span > 3000)  span = 3000;          /* 最多 3000,避免低频时一屏太少 */
+
+        /* ---- 3. 从最新数据往回取 span 个采样 ---- */
+        start = (newest - span + 1 + RING_SIZE) % RING_SIZE;
 
         MoveToEx(hdc, 0, mid, NULL);
-        for (i = 0; i < w; i++) {
-            int p, y;
-            int idx = g_ring_w - (w - i) * step;
-            while (idx < 0) idx += RING_SIZE;
-            idx %= RING_SIZE;
-            p = g_ring[idx];
-            y = mid - (int)((double)p / 32768.0 * (WAVE_H / 2 - 8));
-            LineTo(hdc, i, y);
+        for (i2 = 0; i2 < w; i2++) {
+            /* 把 span 个采样拉伸铺满 w 个像素 */
+            int sample_ofs = (int)((double)i2 * span / w);
+            int idx = (start + sample_ofs) % RING_SIZE;
+            int v = g_ring[idx];
+            int y = mid - (int)((double)v / 32768.0 * (WAVE_H / 2 - 8));
+            LineTo(hdc, i2, y);
         }
     }
+
+
     DeleteObject(pen);
 
     /* 中线 */
@@ -214,21 +261,28 @@ static void draw_wave(HWND hwnd)
         SetBkMode(hdc, TRANSPARENT);
 
         SetTextColor(hdc, RGB(120, 200, 255));
-                wsprintfA(buf, "waveform: %s   cutoff: %d Hz",
+        wsprintfA(buf, "waveform: %s   cutoff: %d Hz",
                   g_wavetype == 0 ? "SINE" : "SQUARE", (int)g_cutoff);
-
         TextOutA(hdc, 15, WIN_H - 78, buf, lstrlenA(buf));
 
         SetTextColor(hdc, RGB(120, 255, 160));
-        TextOutA(hdc, 15, WIN_H - 54, "keys: a s d f g h j k l ;  |  w wave  c/v cutoff  q quit",
+        TextOutA(hdc, 15, WIN_H - 54,
+                 "keys: a s d f g h j k l ;  |  w wave  c/v cutoff  q quit",
                  lstrlenA("keys: a s d f g h j k l ;  |  w wave  c/v cutoff  q quit"));
 
         SelectObject(hdc, old);
         DeleteObject(font);
     }
 
-    ReleaseDC(hwnd, hdc);
+    /* ---------- 一次性贴到屏幕 ---------- */
+    BitBlt(hdc_win, 0, 0, rc.right, rc.bottom, hdc, 0, 0, SRCCOPY);
+
+    SelectObject(hdc, oldbmp);
+    DeleteObject(bmp);
+    DeleteDC(hdc);
+    EndPaint(hwnd, &ps);
 }
+
 
 /* ---------------- 键盘映射 ---------------- */
 static int key_to_owner(WPARAM vk)
@@ -255,12 +309,17 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     switch (msg) {
     case WM_CREATE:
-        SetTimer(hwnd, 1, 30, NULL);
+        SetTimer(hwnd, 1, 16, NULL);
         return 0;
 
-    case WM_TIMER:
+        case WM_TIMER:
+        InvalidateRect(hwnd, NULL, FALSE);   /* 请求重绘,系统会在合适时机调 WM_PAINT */
+        return 0;
+
+            case WM_PAINT:
         draw_wave(hwnd);
         return 0;
+
 
     case WM_KEYDOWN:
         if (wp == 'Q' && (lp & (1<<30)) == 0) {
